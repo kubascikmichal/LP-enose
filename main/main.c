@@ -4,6 +4,7 @@
 #include "ulp_lp_core.h"
 #include "lp_core_i2c.h"
 #include "esp_sleep.h"
+#include "lp_core_main.h"
 
 extern const uint8_t lp_core_main_bin_start[] asm("_binary_lp_core_main_bin_start");
 extern const uint8_t lp_core_main_bin_end[]   asm("_binary_lp_core_main_bin_end");
@@ -49,6 +50,12 @@ void app_main(void)
         init_lp_i2c();
     } else {
         printf("Woke up from LP core\n");
+
+        double temp_c = ulp_temperature / 10000.0;
+        double hum_pct = ulp_humidity / 1024.0;
+        double press_hpa = ulp_pressure / 4096.0;
+
+        printf("Temperature: %.2f, Humidity: %.2f, Pressure: %.2f\n", temp_c, hum_pct, press_hpa);
     }
     ESP_ERROR_CHECK(esp_sleep_enable_ulp_wakeup());
     esp_deep_sleep_start();
