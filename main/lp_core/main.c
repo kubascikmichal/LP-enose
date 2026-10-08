@@ -2,6 +2,10 @@
 #include "ulp_lp_core_print.h"
 #include "ulp_lp_core_utils.h"
 #include "ulp_lp_core_i2c.h"
+#include "bme690_shared_config.h"
+#if defined(BME690_MODE_PRODUCTION)
+#include "model_params.h"
+#endif
 
 #define BME690_I2C_ADDR 0x76  // or 0x77
 #define BME690_REG_DATA 0x1D
@@ -12,7 +16,6 @@
 // instead of one fixed temperature. Different VOCs shift resistance differently
 // at different plate temperatures, so this multi-point profile is what makes
 // the gas reading useful for odor classification instead of just presence/absence.
-#define BME690_NUM_HEATER_STEPS 3
 static const int32_t bme690_heater_target_c[BME690_NUM_HEATER_STEPS] = {200, 300, 400};
 
 
@@ -234,6 +237,120 @@ volatile uint32_t gas_valid[BME690_NUM_HEATER_STEPS];      // gas_valid_r: gas c
 volatile uint32_t heat_stab[BME690_NUM_HEATER_STEPS];      // heat_stab_r: heater reached its target temperature in time
 volatile int32_t  gas_heater_target_c[BME690_NUM_HEATER_STEPS]; // target plate temp per step, so the HP core doesn't need its own copy of the schedule
 
+// Bumped once per completed measurement cycle, in both modes. LOGGING mode's
+// HP-core polling loop watches this to know when a new sample is ready
+// instead of relying on ulp_lp_core_wakeup_main_processor().
+volatile uint32_t sample_seq;
+
+#if defined(BME690_MODE_PRODUCTION)
+// The feature vector and classification result from the most recent cycle,
+// so the HP core has something to log when it's woken by a detection.
+// uint32_t rather than uint8_t: a scalar sub-4-byte LP-core global exports as
+// a 32-bit word with garbage upper bytes (only the low byte is real) - see
+// the gas_range/gas_valid/heat_stab array fix above for the same issue.
+volatile uint32_t last_label;                       // 0 = fresh air, 1 = toilet
+volatile int32_t  last_features[BME690_NUM_FEATURES];
+
+// Rolling "recent fresh air" baseline per heater step, in raw ohms. Only
+// updated on cycles classified as fresh air (see main()), so a sustained
+// toilet-smell event can't drag the baseline towards it.
+static int32_t baseline[BME690_NUM_HEATER_STEPS];
+static bool    baseline_initialized[BME690_NUM_HEATER_STEPS];
+
+// Clamp a raw feature into [min,max] and rescale to 0..1000 for CENTROID/KNN
+// distance comparisons (features have wildly different native scales -
+// pressure ~97500, gas ratio ~100 - so raw distance would just be pressure).
+static int32_t bme690_normalize(int feature_idx, int32_t raw)
+{
+    int32_t lo = bme690_feature_range[feature_idx].min;
+    int32_t hi = bme690_feature_range[feature_idx].max;
+    if (raw < lo) raw = lo;
+    if (raw > hi) raw = hi;
+    if (hi == lo) return 0;
+    return (int32_t)(((int64_t)(raw - lo) * 1000) / (hi - lo));
+}
+
+#if defined(BME690_CLASSIFIER_CENTROID)
+// PLACEHOLDER model (see model_params.h): both centroids are all-zero, so
+// every normalized reading is equidistant from both. Break the tie towards
+// "fresh" (0) so an untrained device never wakes the HP core on garbage.
+static uint8_t classify(const int32_t features[BME690_NUM_FEATURES])
+{
+    int64_t d_fresh = 0, d_toilet = 0;
+    for (int i = 0; i < BME690_NUM_FEATURES; i++) {
+        int32_t n = bme690_normalize(i, features[i]);
+        int32_t df = n - bme690_centroid_fresh[i];
+        int32_t dt = n - bme690_centroid_toilet[i];
+        d_fresh += (int64_t)df * df;
+        d_toilet += (int64_t)dt * dt;
+    }
+    return (d_toilet < d_fresh) ? 1 : 0;
+}
+
+#elif defined(BME690_CLASSIFIER_KNN)
+static uint8_t classify(const int32_t features[BME690_NUM_FEATURES])
+{
+    if (BME690_KNN_NUM_EXAMPLES == 0) {
+        return 0; // PLACEHOLDER: no training examples yet.
+    }
+
+    int64_t best_dist[BME690_KNN_K];
+    uint8_t best_label[BME690_KNN_K];
+    int best_n = 0;
+
+    for (int e = 0; e < BME690_KNN_NUM_EXAMPLES; e++) {
+        int64_t dist = 0;
+        for (int i = 0; i < BME690_NUM_FEATURES; i++) {
+            int32_t n = bme690_normalize(i, features[i]);
+            int32_t d = n - bme690_knn_examples[e].features[i];
+            dist += (int64_t)d * d;
+        }
+
+        if (best_n < BME690_KNN_K || dist < best_dist[BME690_KNN_K - 1]) {
+            int pos = (best_n < BME690_KNN_K) ? best_n++ : BME690_KNN_K - 1;
+            while (pos > 0 && best_dist[pos - 1] > dist) {
+                best_dist[pos] = best_dist[pos - 1];
+                best_label[pos] = best_label[pos - 1];
+                pos--;
+            }
+            best_dist[pos] = dist;
+            best_label[pos] = bme690_knn_examples[e].label;
+        }
+    }
+
+    int votes_toilet = 0;
+    for (int i = 0; i < best_n; i++) votes_toilet += best_label[i];
+    return (votes_toilet * 2 > best_n) ? 1 : 0;
+}
+
+#elif defined(BME690_CLASSIFIER_RF)
+static uint8_t rf_walk_tree(uint8_t tree, const int32_t features[BME690_NUM_FEATURES])
+{
+    uint8_t node_idx = bme690_rf_tree_root[tree];
+    while (1) {
+        const bme690_rf_node_t *node = &bme690_rf_nodes[tree][node_idx];
+        if (node->feature_idx < 0) {
+            return (uint8_t)node->left; // leaf: predicted label stored in `left`
+        }
+        node_idx = (uint8_t)((features[node->feature_idx] <= node->threshold) ? node->left : node->right);
+    }
+}
+
+static uint8_t classify(const int32_t features[BME690_NUM_FEATURES])
+{
+    if (BME690_RF_NUM_TREES == 0) {
+        return 0; // PLACEHOLDER: no trained trees yet.
+    }
+
+    int votes_toilet = 0;
+    for (int t = 0; t < BME690_RF_NUM_TREES; t++) {
+        votes_toilet += rf_walk_tree(t, features);
+    }
+    return (votes_toilet * 2 > BME690_RF_NUM_TREES) ? 1 : 0;
+}
+#endif
+#endif // BME690_MODE_PRODUCTION
+
 static void bme690_soft_reset()
 {
     uint8_t cmd[2] = {0xE0, 0xB6}; // reset register
@@ -428,6 +545,7 @@ int main (void)
     temperature = 0;
     humidity = 0;
     pressure = 0;
+    sample_seq = 0;
     for (int i = 0; i < BME690_NUM_HEATER_STEPS; i++) {
         gas_resistance[i] = 0;
         gas_range[i] = 0;
@@ -435,13 +553,61 @@ int main (void)
         heat_stab[i] = 0;
     }
 
+#if defined(BME690_MODE_PRODUCTION)
+    last_label = 0;
+    for (int i = 0; i < BME690_NUM_FEATURES; i++) last_features[i] = 0;
+    for (int i = 0; i < BME690_NUM_HEATER_STEPS; i++) baseline_initialized[i] = false;
+    uint8_t debounce_count = 0;
+    bool    armed = true; // fires once per fresh->toilet transition, re-arms once fresh air returns
+#endif
+
     bme690_soft_reset();
     bme690_read_calib();  // needed first: bme690_init() computes res_heat_x from calib data
     bme690_init();
 
     while (1) {
-        ulp_lp_core_delay_us(5000000);  // 500ms cooldown
+        ulp_lp_core_delay_us(5000000);  // 5s cooldown between scans
         bmp690_read_data(&temperature, &humidity, &pressure, gas_resistance, gas_range, gas_valid, heat_stab);
+        sample_seq++;
+
+#if defined(BME690_MODE_PRODUCTION)
+        int32_t features[BME690_NUM_FEATURES];
+        for (int i = 0; i < BME690_NUM_HEATER_STEPS; i++) {
+            if (!baseline_initialized[i]) {
+                // Bootstrap assumption: the very first reading is fresh air.
+                baseline[i] = (int32_t)gas_resistance[i];
+                baseline_initialized[i] = true;
+            }
+            // Percent of baseline *100 (100 = at baseline; VOCs typically lower
+            // resistance, so a toilet-smell reading should read below 100).
+            features[i] = (baseline[i] > 0)
+                ? (int32_t)(((int64_t)gas_resistance[i] * 100) / baseline[i])
+                : 100;
+        }
+        features[BME690_NUM_HEATER_STEPS + 0] = (int32_t)temperature; // °C *100
+        features[BME690_NUM_HEATER_STEPS + 1] = (int32_t)humidity;    // %RH *100
+        features[BME690_NUM_HEATER_STEPS + 2] = (int32_t)pressure;    // Pa
+
+        uint8_t label = classify(features);
+        last_label = label;
+        for (int i = 0; i < BME690_NUM_FEATURES; i++) last_features[i] = features[i];
+
+        if (label == 1) { // toilet
+            if (debounce_count < 0xFF) debounce_count++;
+        } else { // fresh air: reset debounce, re-arm, and adapt the baseline
+            debounce_count = 0;
+            armed = true;
+            for (int i = 0; i < BME690_NUM_HEATER_STEPS; i++) {
+                baseline[i] += (int32_t)(((int64_t)gas_resistance[i] - baseline[i]) / BME690_BASELINE_EMA_DIVISOR);
+            }
+        }
+
+        if (armed && debounce_count >= BME690_DEBOUNCE_CYCLES) {
+            armed = false; // don't fire again until fresh air is seen
+            ulp_lp_core_wakeup_main_processor();
+        }
+#else
         ulp_lp_core_wakeup_main_processor();
+#endif
     }
 }
