@@ -1,10 +1,15 @@
 #include <stdio.h>
+#include <inttypes.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "ulp_lp_core.h"
 #include "lp_core_i2c.h"
 #include "esp_sleep.h"
 #include "lp_core_main.h"
+
+// Must match BME690_NUM_HEATER_STEPS in main/lp_core/main.c; there's no shared
+// header between the two binaries, so this is kept in sync by hand.
+#define BME690_NUM_HEATER_STEPS 3
 
 extern const uint8_t lp_core_main_bin_start[] asm("_binary_lp_core_main_bin_start");
 extern const uint8_t lp_core_main_bin_end[]   asm("_binary_lp_core_main_bin_end");
@@ -51,11 +56,20 @@ void app_main(void)
     } else {
         printf("Woke up from LP core\n");
 
-        double temp_c = ulp_temperature / 10000.0;
-        double hum_pct = ulp_humidity / 1024.0;
-        double press_hpa = ulp_pressure / 4096.0;
+        double temp_c = ulp_temperature / 100.0;
+        double hum_pct = ulp_humidity / 100.0;
+        double press_hpa = ulp_pressure / 100.0;
 
-        printf("Temperature: %.2f, Humidity: %.2f, Pressure: %.2f\n", temp_c, hum_pct, press_hpa);
+        printf("Temperature: %.2f C, Humidity: %.2f %%, Pressure: %.2f hPa\n", temp_c, hum_pct, press_hpa);
+
+        // One gas resistance reading per heater step (the "gas scan"): BME690 cycles
+        // the heater through several target temperatures each cycle, since different
+        // VOCs shift resistance differently at different plate temperatures.
+        for (int i = 0; i < BME690_NUM_HEATER_STEPS; i++) {
+            printf("  Gas[%d] target=%" PRIu32 " C: %" PRIu32 " ohm (range=%" PRIu32 " valid=%" PRIu32 " heat_stab=%" PRIu32 ")\n",
+                   i, ulp_gas_heater_target_c[i], ulp_gas_resistance[i],
+                   ulp_gas_range[i], ulp_gas_valid[i], ulp_heat_stab[i]);
+        }
     }
     ESP_ERROR_CHECK(esp_sleep_enable_ulp_wakeup());
     esp_deep_sleep_start();
